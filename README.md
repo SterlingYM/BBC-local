@@ -150,6 +150,16 @@ SALT2mu uses these weights (checked line by line against `SALT2mu.c` and `sntool
   sorted order (even number). The parity is that of the count, not of the weights. When tied values with different weights
   meet at the crossing, the result depends on how the tied elements are ordered; `bbclocal` then reproduces the GSL
   heapsort that SALT2mu uses.
+- **Undefined weighted medians** (`BBC(..., undefined_median="raise" | "standard")`). SALT2mu's weighted median has no
+  defined result in two cases: the running sum never reaches half the total (rounding; not expected with weights >= 0),
+  or the crossing is at the last element with an even count (the C code then reads past the end of its index array). The
+  second case does occur with soft, fractional `SIM_WGT_POP` (for example colour-window probabilities), in the MUCOVSCALE
+  cells. With the default `"raise"`, `bbclocal` raises `RuntimeError` there. With `"standard"` it returns the conventional
+  weighted median instead: the value of the crossing element, i.e. the smallest sorted value whose cumulative weight
+  reaches half the total (the largest value in the rounding case). **This is not a SNANA result**; it is used only where
+  SALT2mu's result is undefined, and every defined case is unchanged (tested on random data; the default path is
+  bit-identical to the previous version on a real-data fit). `B.n_undefined_median` (after `prepare()`) and the fit
+  result's `n_undefined_median` count how often the fallback was used; a total weight of 0 still raises.
 - **Weighted STD** (`arrayStat_STD`, used for the sigint of the map weights from the events with `SNRMAX1 >= 60`): the
   mean pull and the mean variance are weighted means, but the STD is `sqrt(sum(w x^2)/N - (sum(w x)/N)^2)` with N the
   **count**, not the sum of the weights. This is a quirk of SALT2mu and is reproduced as is.
