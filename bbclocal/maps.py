@@ -30,11 +30,12 @@ def sigint_scan(mures, mucov, use_mad, abort=True, bisect=True):
     """sigint_muresid_list: scan sigint downward in steps of 0.01 from an approximate start until the STD (or 1.48 MAD) of the
     pull crosses 1; linear interpolation between the bracketing steps. Negative sigint means sigint*|sigint| < 0 is added.
 
-    The trial values, the one-time upward adjustment (when the first evaluation has STD(pull) > 1) and the stopping rule are
-    those of SALT2mu. With bisect=True the trial value at which the scan stops (the first one with STD(pull) > 1) is found by
-    bisection over the same sequence of trial values, which assumes that STD(pull) does not increase with sigint (true when
-    the pull errors are similar, as in the bias-correction samples); the result then depends only on the bracketing pair and
-    equals that of the step-by-step scan (bisect=False)."""
+    The trial values, the one-time upward adjustment (when the first evaluation exceeds 1) and the stopping rule are those of
+    SALT2mu. For the MAD (use_mad=True, the MUCOVADD cells) with every mucov >= 0.02^2, each |pull| and hence 1.48 MAD(pull)
+    cannot increase with sigint, so the trial value at which the scan stops (the first one above 1) is found by bisection over
+    the same sequence of trial values; the result depends only on the bracketing pair and is identical to that of the
+    step-by-step scan. STD(pull) has no such guarantee (the mean pull also changes), so use_mad=False always scans step by
+    step, as does bisect=False."""
     mures = np.asarray(mures, float)
     mucov = np.asarray(mucov, float)
     avg_cov = np.mean(mucov)
@@ -55,11 +56,12 @@ def sigint_scan(mures, mucov, use_mad, abort=True, bisect=True):
     while sig >= lo:
         seq.append(sig)
         sig -= 0.01
-    if bisect:
+    # monotonic only with the MAD and no 0.02^2 floor jump at sigint = 0 (floor applies only for negative sigint)
+    if bisect and use_mad and mucov.min() >= 0.02 ** 2:
         if _std_pull(dev, mucov, seq[-1], use_mad) <= 1.0:
             stop = None
         else:
-            j0, j1 = -1, len(seq) - 1      # STD(pull) > 1 at seq[j1]; <= 1 at seq[j0] (or j0 = -1)
+            j0, j1 = -1, len(seq) - 1      # MAD > 1 at seq[j1]; <= 1 at seq[j0] (or j0 = -1)
             while j1 - j0 > 1:
                 mid = (j0 + j1) // 2
                 if _std_pull(dev, mucov, seq[mid], use_mad) > 1.0:

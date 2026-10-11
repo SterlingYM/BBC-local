@@ -25,8 +25,10 @@ twice) and deriving per-row quantities; the fit itself is a few percent of the r
 4. computes the sample assignment of each simulated event and the cuts that do not depend on the population (redshift, x1,
    c and host windows, error cuts) once per sample definition and caches them with the simulations, so a fit with other
    `CUTWIN`s applies only its own windows to the pre-selected rows;
-5. finds the step of the `sigint_muresid_list` scan at which STD(pull) first exceeds 1 by bisection over the same sequence
-   of trial values (STD(pull) decreases as sigint increases), which gives the same result as the step-by-step scan;
+5. in the per-cell MUCOVADD scans (`sigint_muresid_list` with the MAD), finds the step at which 1.48 MAD(pull) first
+   exceeds 1 by bisection over the same sequence of trial values. Each |pull| cannot increase with sigint, so neither can
+   their median, and the result is identical to that of the step-by-step scan. The STD(pull) scan has no such guarantee
+   and is done step by step;
 6. in the covariance helper, treats the systematic part of the covariance as low rank and solves with the Woodbury identity.
 
 Typical cost on a laptop: about 9 s to read and derive ~4 million simulated rows from npz files, then 3-8 s per BBC fit

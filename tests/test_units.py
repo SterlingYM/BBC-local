@@ -146,6 +146,32 @@ def test_sigint_scan_bisection_equals_stepwise():
     assert {"interp", "fail", "adjusted"} <= seen
 
 
+def test_sigint_scan_std_steps_mad_bisects(monkeypatch):
+    """STD(pull) is not guaranteed monotonic in sigint, so its scan must visit the trial values one by one; the MAD scan
+    (monotonic when every mucov >= 0.02^2) bisects."""
+    import bbclocal.maps as maps
+    calls = []
+    orig = maps._std_pull
+
+    def spy(dev, mucov, sig, use_mad):
+        calls.append(sig)
+        return orig(dev, mucov, sig, use_mad)
+    monkeypatch.setattr(maps, "_std_pull", spy)
+    rng = np.random.default_rng(5)
+    err = rng.uniform(0.05, 0.15, 5000)
+    res = rng.normal(0, np.sqrt(err ** 2 + 0.1 ** 2))
+    calls.clear()
+    maps.sigint_scan(res, err ** 2, use_mad=False)
+    steps = np.diff(calls[1:-2])               # skip the first call and the final two (bracketing pair) calls
+    assert len(steps) > 10 and np.allclose(steps, -0.01)
+    calls.clear()
+    maps.sigint_scan(res, err ** 2, use_mad=True)
+    assert len(calls) < 15                     # 1 + ~log2(110) + 2
+    calls.clear()
+    maps.sigint_scan(res, np.r_[err[:-1], 0.01] ** 2, use_mad=True)    # a mucov below 0.02^2: step by step
+    assert np.allclose(np.diff(calls[1:-2]), -0.01) and len(calls) > 15
+
+
 # ---------------------------------------------------------------- covariance helper
 def test_woodbury_matches_dense():
     rng = np.random.default_rng(0)
