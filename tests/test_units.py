@@ -153,9 +153,9 @@ def test_sigint_scan_std_steps_mad_bisects(monkeypatch):
     calls = []
     orig = maps._std_pull
 
-    def spy(dev, mucov, sig, use_mad):
+    def spy(dev, mucov, sig, use_mad, wgt=None):
         calls.append(sig)
-        return orig(dev, mucov, sig, use_mad)
+        return orig(dev, mucov, sig, use_mad, wgt)
     monkeypatch.setattr(maps, "_std_pull", spy)
     rng = np.random.default_rng(5)
     err = rng.uniform(0.05, 0.15, 5000)

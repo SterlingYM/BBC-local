@@ -58,6 +58,16 @@ def _sim_windows(cfg):
     return w
 
 
+def _check_weights(w, n):
+    w = np.asarray(w)
+    if w.shape != (n,):
+        raise ValueError(f"population weights must have one value per simulated row ({n}), got shape {w.shape}")
+    w = w.astype(np.float32).astype(np.float64)
+    if not np.isfinite(w).all() or (w < 0).any():
+        raise ValueError("population weights (SIM_WGT_POP) must be finite and >= 0")
+    return w
+
+
 class BiasCorSims:
     """Bias-correction simulations of one model (all files of simfile_biascor), with the per-row quantities SALT2mu derives
     from them. These do not depend on the data or on the population cuts, so one object can serve many fits.
@@ -114,8 +124,11 @@ class BiasCorSims:
         for m in metas:
             if m.get("SIM_gammaDM_nunique", 1) > 1 or any(abs(v) > 0 for v in m.get("SIM_gammaDM_unique", [0.0])):
                 raise UnsupportedOptionError("SIM_gammaDM != 0 in the bias-correction simulations is not implemented")
-        if "SIM_WGT_POP" in S and not np.all(S["SIM_WGT_POP"] == 1):
-            raise UnsupportedOptionError("SIM_WGT_POP != 1: weighted medians/STD of SALT2mu are not reproduced")
+        wpop = None
+        if "SIM_WGT_POP" in S:
+            wpop = _check_weights(S["SIM_WGT_POP"], len(S["zHD"]))
+            if np.all(wpop == 1):
+                wpop = None                        # unit weights: the unweighted code path (identical results)
         if any(m.get("legacy") for m in metas):
             warnings.warn("legacy npz without metadata: SIM_gammaDM assumed 0, pre-applied cuts assumed compatible")
         self.a_sim, self.b_sim = float(a_sim), float(b_sim)
@@ -133,7 +146,38 @@ class BiasCorSims:
             - S["SIM_MUz"].astype(float)
         self.S = S
         self.nrow = len(S["zHD"])
+        self.weights = wpop        # float64 copy of the float32 SIM_WGT_POP, or None when all are 1
+        self.keep = None           # rows excluded by with_weights(min_weight=...): False
+        self.min_weight = None
         self._cut_cache = {}       # see BBC._sim_base_rows
+
+    def with_weights(self, w, min_weight=None):
+        """A lightweight view of these simulations with SIM_WGT_POP replaced by w (one value per row, in file order).
+
+        The view shares every large array with this object (no copy); only the weights (and, with min_weight, a row mask)
+        are new. Its cache of population-independent rows is its own. The weights are stored as float32, as SALT2mu reads
+        SIM_WGT_POP, and must be finite and >= 0. A view of a view takes its rows from the same underlying arrays and
+        replaces the weights and the mask of the view it was made from.
+
+        Semantics (faithful to SALT2mu with SIM_WGT_POP = w): see README, "Population weights". In short, the weights
+        enter the weighted averages of the maps, the weighted median of MUCOVSCALE and the weighted STD of the map sigint,
+        but every row, whatever its weight, counts toward NperCell and the other count thresholds and enters the
+        unweighted MUCOVADD scan. A row with weight 0 is therefore NOT the same as a row that is absent.
+
+        min_weight: None (default; faithful) or a number. With a number, rows with w <= min_weight are removed from the
+        simulations before any map is made (they do not count toward any threshold and do not enter MUCOVADD). This is a
+        bbclocal option that SALT2mu does not have: SALT2mu with SIM_WGT_POP = w gives a different result, unless no count
+        and no unweighted statistic changes. It equals SALT2mu run on simulation files from which those rows were deleted."""
+        w32 = _check_weights(np.asarray(w), self.nrow).astype(np.float32)
+        v = object.__new__(type(self))
+        v.__dict__.update(self.__dict__)
+        v.S = dict(self.S)                         # new dict, same arrays
+        v.S["SIM_WGT_POP"] = w32
+        v.weights = w32.astype(np.float64)
+        v.min_weight = None if min_weight is None else float(min_weight)
+        v.keep = None if min_weight is None else (w32 > min_weight)
+        v._cut_cache = {}
+        return v
 
     def _check_precuts(self, cfg):
         """Cuts already applied by bbclocal-extract must be implied by the current configuration."""
@@ -212,11 +256,13 @@ class BBC:
             raise RuntimeError(f"only {len(hi)} bias-correction rows with SNRMAX1 >= {SNR_SIGINT} pass the cuts (need 50)")
         a, b = self.sims.a_sim, self.sims.b_sim
         merr2 = muerrsq_full(S["cov"][:, hi], a, b, S["zHD"][hi].astype(float), S["zmuerr"][hi], cfg.lensing_zpar)
-        self.sigint_biascor = sigint_scan(S["muresid"][hi], merr2, use_mad=False)
+        wpop = self.sims.weights
+        self.sigint_biascor = sigint_scan(S["muresid"][hi], merr2, use_mad=False,
+                                          wgt=None if wpop is None else wpop[hi])
         self.maps = {}
         for k in range(len(self.samples.samples)):
             rows = pas[s_smp[pas] == k]
-            M = SampleMaps(self.zgrid[k], self.mgrid, S, rows, self.sigint_biascor ** 2, a, b, cfg, cfg.zmax)
+            M = SampleMaps(self.zgrid[k], self.mgrid, S, rows, self.sigint_biascor ** 2, a, b, cfg, cfg.zmax, wpop=wpop)
             M.make_mucov(S, cfg)
             self.maps[k] = M
         # data cuts and per-event bias and error corrections
@@ -234,6 +280,8 @@ class BBC:
             v, st, ns = M.interp(z, m, d["x1"][q].astype(float), c)
             add, scl, okc = M.mucov(z, m, c)
             good = (st > 0) & okc
+            if np.isnan(v[good]).any():
+                raise RuntimeError("NaN bias correction for a data event (zero total weight in a bias-map cell)")
             self.mubias[q[good]] = v[good]
             self.covadd[q[good]] = add[good]
             self.covscale[q[good]] = scl[good]
@@ -266,6 +314,8 @@ class BBC:
             for k, sm in enumerate(smp.samples):
                 zmax_row[s_smp == k] = cfg.zmax + sm.zbin
             ok = self._selection(S, is_data=False, zmax_row=zmax_row, cutwins=False) & (s_smp >= 0)
+            if self.sims.keep is not None:
+                ok &= self.sims.keep                  # with_weights(min_weight=...): excluded rows
             entry["base"][wkey] = np.nonzero(ok)[0]
         return s_smp, entry["base"][wkey]
 
@@ -412,6 +462,7 @@ class BBC:
             "n_chi2max_reject": int(self.n_chi2max_reject),
             "NCOVFIX_data": int(d["NCOVFIX"]), "NCOVFIX_biascor": int(self.sims.S["NCOVFIX"]),
             "dust_flag": self.sims.dust_flag,
+            "population_weights": self.sims.weights is not None, "min_weight": self.sims.min_weight,
             "samples": [{"IDSAMPLE": k, "name": smp.name, "zbin": smp.zbin, "N_data_all": int((self.data_sample == k).sum()),
                          "N_fit": int(((self.data_sample == k) & u).sum()), "N_biascor": int(self.maps[k].nsim),
                          "z_grid": [float(self.zgrid[k].lo[0]), float(self.zgrid[k].hi[-1])]}

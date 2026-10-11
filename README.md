@@ -46,7 +46,9 @@ Supported:
   (IDSAMPLE), with the MUCOVSCALE and MUCOVADD error maps (bit 2048, MAD, is implied, as in SALT2mu).
 - Bias-correction simulations whose map has a single (alpha, beta, gammaDM) cell: either SALT2mu's dust flag is set (any of
   the first 20 simulated rows has `SIM_AV > 0`, so `SIM_alpha`, `SIM_beta` are overwritten by `p1`, `p2`), or the simulations
-  have a single `SIM_alpha` and `SIM_beta` equal to `p1`, `p2`. `SIM_gammaDM` must be 0 and `SIM_WGT_POP` must be 1.
+  have a single `SIM_alpha` and `SIM_beta` equal to `p1`, `p2`. `SIM_gammaDM` must be 0.
+- Per-event population weights of the bias-correction simulations (`SIM_WGT_POP`, finite and >= 0), read from the files or
+  set after loading with `BiasCorSims.with_weights` (see "Population weights" below).
 - `surveygroup_biascor` with `zbin=` for every group (survey names need a `SURVEY.DEF` file or a name-to-IDSURVEY map, or
   can be written as IDSURVEY integers) and `fieldGroup_biascor` (substring matching on `+`-separated fields, first group wins,
   as in SALT2mu).
@@ -75,7 +77,7 @@ iteration; the secant update of sigint.
 
 - any `opt_biascor` other than 4336 (plus 2048);
 - bias-correction simulations that need alpha/beta-dependent maps (several `SIM_alpha` or `SIM_beta` values without the
-  dust flag), `SIM_gammaDM != 0`, `SIM_WGT_POP != 1`;
+  dust flag), `SIM_gammaDM != 0`, negative or non-finite `SIM_WGT_POP`;
 - CC prior / BEAMS (`varname_pIa`, `simfile_ccprior`), photo-z options, BayeSN, `prescale_biascor`;
 - `interp_biascor_logmass=1` (SALT2mu's default, so it must be set to 0 explicitly), `sigma_cell_biascor < 10`;
 - survey groups without `zbin`, per-group `x1bin`/`cbin`, exact-match field groups (`|`), `fieldlist_biascor`;
@@ -126,6 +128,67 @@ are included in this repository).
   SALT2mu's convention (e.g. `DES(X3)`).
 - The output column `CUTFLAG` is `bbclocal`'s own bit mask (1 selection, 2 cid_reject, 4 no valid bias correction,
   8 chi2max), not SALT2mu's `CUTMASK`.
+
+## Population weights
+
+SALT2mu reads an optional column `SIM_WGT_POP` from the bias-correction files and uses it as a per-event weight when it
+builds the bias-correction maps. A typical use is to reweight one set of simulations to a different population (for
+example, a different color or stretch distribution) instead of generating new simulations. `bbclocal` reproduces how
+SALT2mu uses these weights (checked line by line against `SALT2mu.c` and `sntools.c`):
+
+- **Bias map.** The weight of a simulated event in the averages of each 5D cell (the cell's mean z, host, x1 and c, and
+  the bias value) is `SIM_WGT_POP / sigma_mu^2` instead of `1 / sigma_mu^2`.
+- **Counts are not weighted.** SALT2mu counts every simulated event that passes the cuts toward the number of events in a
+  cell, whatever its weight. All count thresholds (`min_per_cell_biascor`, the minimum summed count of 10 over the
+  interpolation cells, the 5 events needed for an error-map cell, the 50 events with `SNRMAX1 >= 60` for the map sigint)
+  therefore use counts.
+- **Error maps.** MUCOVSCALE is (1.48 x weighted median of |pull|)^2 with the population weights; the cell averages used to
+  interpolate the error maps are weighted by `SIM_WGT_POP`. MUCOVADD, however, comes from an **unweighted** scan: SALT2mu
+  calls `sigint_muresid_list` there without weights.
+- **Weighted median** (`arrayStat_MEDIAN`): sort the values, add their weights in sorted order until the running sum
+  reaches half the total, and take that element (odd number of events) or the mean of that element and the next one in
+  sorted order (even number). The parity is that of the count, not of the weights. When tied values with different weights
+  meet at the crossing, the result depends on how the tied elements are ordered; `bbclocal` then reproduces the GSL
+  heapsort that SALT2mu uses.
+- **Weighted STD** (`arrayStat_STD`, used for the sigint of the map weights from the events with `SNRMAX1 >= 60`): the
+  mean pull and the mean variance are weighted means, but the STD is `sqrt(sum(w x^2)/N - (sum(w x)/N)^2)` with N the
+  **count**, not the sum of the weights. This is a quirk of SALT2mu and is reproduced as is.
+- The RMS and statistical error of the bias in each cell (`SampleMaps.bias_rms_err()`, diagnostics only, because SALT2mu
+  sets the bias error to 0 before the fit) use sums weighted by `SIM_WGT_POP` alone.
+- The weights are stored as float32, as SALT2mu reads them.
+
+Consequences worth knowing:
+
+- A weight of 2 on an event is equivalent to listing the event twice for the weighted averages (bias, cell averages), but
+  not for the counts, the weighted STD (whose denominator is the count) or MUCOVADD (unweighted).
+- A weight of 0 is **not** the same as removing the event: the event still counts toward every threshold and still enters
+  the MUCOVADD scan. If every event of a cell that passes a count threshold has weight 0, SALT2mu divides 0 by 0 (bias map)
+  or aborts (weighted median); `bbclocal` raises an error in both cases.
+- Cases in which SALT2mu's behavior is undefined raise an error: the weighted median when the crossing falls on the last
+  element with an even count (SALT2mu reads past the end of its index array).
+- The weighted mean redshift per fit bin (`calc_zM0_biasCor`, used only for the redshift column of SALT2mu's M0DIF output)
+  is not computed by `bbclocal`.
+
+From Python, weights can be set after loading without copying the simulations:
+
+```python
+sims = BiasCorSims(biascor_files, cfg)
+w = my_population_weights(sims.S)          # one value per simulated row, in file order
+view = sims.with_weights(w)                # shares all large arrays with sims; SIM_WGT_POP replaced by w
+B = BBC(cfg, data, view).prepare()
+```
+
+The view has its own cache of the population-independent row selection, so views with different weights do not interfere
+with each other or with the original object.
+
+`with_weights(w, min_weight=x)` is an option that SALT2mu does not have: rows with `w <= x` are removed from the
+simulations before any map is made, so they no longer count toward the thresholds or enter MUCOVADD. The result equals
+SALT2mu run on bias-correction files from which those rows were deleted, and in general differs from SALT2mu run with
+`SIM_WGT_POP = w`. Use it, for example, with `min_weight=0` when the weights select a sub-population and the remaining
+rows should play no role at all. The default (`min_weight=None`) is faithful to SALT2mu.
+
+With all weights equal to 1, the weighted code path gives results bit-identical to the unweighted one (checked on real data
+for the global fit and two color windows on two data samples).
 
 ## Installation
 
@@ -195,7 +258,7 @@ pip install pytest && pytest -q tests     # ~30 s, synthetic data only
 | `samples.py` | survey and field groups -> bias-correction samples |
 | `binning.py` | SALT2mu bin edges and bin lookup, `powz` redshift bins |
 | `model.py` | per-event mB, covariance (with the eigenvalue fix), distance errors, host step |
-| `maps.py` | 5D bias map, its interpolation, MUCOVSCALE/MUCOVADD maps, sigint scan |
+| `maps.py` | 5D bias map, its interpolation, MUCOVSCALE/MUCOVADD maps, sigint scan, weighted median/STD of SALT2mu |
 | `core.py` | `BiasCorSims` (simulations + derived quantities) and `BBC` (cuts, maps, fit, outputs) |
 | `covfit.py` | low-rank distance covariance (Woodbury) and the wfit-like grid fit |
 | `cache.py` | per-process cache of prepared simulations |
