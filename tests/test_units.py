@@ -81,6 +81,71 @@ def test_sigint_scan_recovers_scatter():
     assert abs(s - 0.1) < 0.01
 
 
+def _sigint_scan_stepwise(mures, mucov, use_mad, abort=True):
+    """Straightforward transcription of the SALT2mu step-by-step scan (sigint_muresid_list), for comparison."""
+    avg_cov, avg_res = np.mean(mucov), np.mean(mures)
+    if use_mad:
+        std_orig = 1.48 * np.median(np.abs(mures))
+    else:
+        std_orig = np.sqrt(max(np.mean(mures ** 2) - np.mean(mures) ** 2, 0.0))
+    tmp = std_orig ** 2 - avg_cov
+    approx = -np.sqrt(abs(tmp)) if tmp < 0 else np.sqrt(tmp)
+    lo, sig = approx - 50 * 0.01 - 1e-7, approx + 60 * 0.01
+    sig_store, pull_store, adjusted = [], [], False
+    while True:
+        if sig < lo:
+            if abort:
+                raise RuntimeError("fail")
+            return lo, "fail", adjusted
+        covt = sig * abs(sig)
+        tot = mucov + covt
+        if covt < 0:
+            tot = np.where(tot < 0.02 ** 2, 0.02 ** 2, tot)
+        pull = (mures - avg_res) / np.sqrt(tot)
+        sp = 1.48 * np.median(np.abs(pull)) if use_mad else np.sqrt(max(np.mean(pull ** 2) - np.mean(pull) ** 2, 0.0))
+        if not sig_store and not adjusted and sp > 1.0:
+            sig += (sp - 1.0) + 0.1
+            adjusted = True
+            continue
+        sig_store.append(sig)
+        pull_store.append(sp)
+        sig -= 0.01
+        if sp > 1.0:
+            break
+    if len(sig_store) == 1 and abs(pull_store[0] - 1.0) < 0.001:
+        return sig_store[0], "single", adjusted
+    return float(np.interp(1.0, np.array(pull_store), np.array(sig_store))), "interp", adjusted
+
+
+def test_sigint_scan_bisection_equals_stepwise():
+    rng = np.random.default_rng(11)
+    seen = set()
+    for trial in range(300):
+        n = int(rng.integers(20, 3000))
+        kind = trial % 3
+        if kind == 0:        # ordinary: scatter + errors of similar size
+            err = rng.uniform(0.03, 0.2, n)
+            res = rng.normal(0.0, np.sqrt(err ** 2 + rng.uniform(0, 0.2) ** 2))
+        elif kind == 1:      # a few very large errors pull the start value far down: upward adjustment
+            err = np.full(n, 0.02)
+            err[: max(1, n // 50)] = rng.uniform(3, 10)
+            res = rng.normal(0.0, rng.uniform(0.1, 0.4), n)
+        else:                # residuals far below the errors: the scan never reaches STD(pull) = 1
+            err = rng.uniform(0.5, 1.0, n)
+            res = rng.normal(0.0, 1e-4, n)
+        for use_mad in (False, True):
+            ref, how, adjusted = _sigint_scan_stepwise(res, err ** 2, use_mad, abort=False)
+            seen.add(how)
+            if adjusted:
+                seen.add("adjusted")
+            assert sigint_scan(res, err ** 2, use_mad, abort=False) == ref
+            assert sigint_scan(res, err ** 2, use_mad, abort=False, bisect=False) == ref
+            if how == "fail":
+                with pytest.raises(RuntimeError):
+                    sigint_scan(res, err ** 2, use_mad)
+    assert {"interp", "fail", "adjusted"} <= seen
+
+
 # ---------------------------------------------------------------- covariance helper
 def test_woodbury_matches_dense():
     rng = np.random.default_rng(0)

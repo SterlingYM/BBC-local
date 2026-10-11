@@ -24,6 +24,7 @@ PAR_BOUNDS = {"alpha": (0.02, 0.30), "beta": (1.0, 6.0), "gamma": (-0.5, 0.5)}  
 MAXFITITER = 20
 SNR_SIGINT = 60.0
 MIN_SIGINT_EVENTS = 50
+SIM_CACHE_MAX = 8      # cached sample assignments / pre-cut row sets per BiasCorSims object
 
 # bbclocal's own cut flags (not SALT2mu's CUTMASK bit values)
 CUT_SELECTION = 1      # CUTWIN, legacy windows (z, x1, c, host), BADERR, BADCOV
@@ -132,6 +133,7 @@ class BiasCorSims:
             - S["SIM_MUz"].astype(float)
         self.S = S
         self.nrow = len(S["zHD"])
+        self._cut_cache = {}       # see BBC._sim_base_rows
 
     def _check_precuts(self, cfg):
         """Cuts already applied by bbclocal-extract must be implied by the current configuration."""
@@ -196,22 +198,24 @@ class BBC:
                 raise UnsupportedOptionError(f"sample '{smp.name}' has no zbin (add it to surveygroup_biascor)")
             self.zgrid[k] = biascor_zgrid(d["zHD"][d_smp == k], smp.zbin)
         self.mgrid = bininfo(cfg.logmass_min, cfg.logmass_max, (cfg.logmass_max - cfg.logmass_min) / cfg.nbin_logmass)
-        # simulations: sample, cuts
-        s_smp = self.samples.assign(S["IDSURVEY"], S["FIELD_CODE"], S["FIELD_NAMES"])
-        zmax_row = np.full(len(s_smp), -1.0)
-        for k, smp in enumerate(self.samples.samples):
-            zmax_row[s_smp == k] = cfg.zmax + smp.zbin
-        pas = self._selection(S, is_data=False, zmax_row=zmax_row) & (s_smp >= 0)
+        # simulations: sample and cuts. The cuts other than the CUTWINs are computed once per sample definition and
+        # window set and cached on the simulations object; the CUTWINs are then applied to those rows only.
+        s_smp, base = self._sim_base_rows()
+        ok = np.ones(len(base), bool)
+        for cw in cfg.cutwins:
+            if not cw.dataonly:
+                ok &= window(S[cw.var][base], cw.lo, cw.hi)
+        pas = base[ok]                                   # indices (ascending) of the rows passing all cuts
         # sigint for the map weights: SNR >= 60 rows passing all cuts (all samples), STD of the pull
-        hi = pas & (S["SNRMAX1"] >= SNR_SIGINT)
-        if hi.sum() < MIN_SIGINT_EVENTS:
-            raise RuntimeError(f"only {hi.sum()} bias-correction rows with SNRMAX1 >= {SNR_SIGINT} pass the cuts (need 50)")
+        hi = pas[S["SNRMAX1"][pas] >= SNR_SIGINT]
+        if len(hi) < MIN_SIGINT_EVENTS:
+            raise RuntimeError(f"only {len(hi)} bias-correction rows with SNRMAX1 >= {SNR_SIGINT} pass the cuts (need 50)")
         a, b = self.sims.a_sim, self.sims.b_sim
         merr2 = muerrsq_full(S["cov"][:, hi], a, b, S["zHD"][hi].astype(float), S["zmuerr"][hi], cfg.lensing_zpar)
         self.sigint_biascor = sigint_scan(S["muresid"][hi], merr2, use_mad=False)
         self.maps = {}
         for k in range(len(self.samples.samples)):
-            rows = np.nonzero(pas & (s_smp == k))[0]
+            rows = pas[s_smp[pas] == k]
             M = SampleMaps(self.zgrid[k], self.mgrid, S, rows, self.sigint_biascor ** 2, a, b, cfg, cfg.zmax)
             M.make_mucov(S, cfg)
             self.maps[k] = M
@@ -238,10 +242,37 @@ class BBC:
         self.cutflag = cut
         return self
 
-    def _selection(self, t, is_data, zmax_row):
+    def _sim_base_rows(self):
+        """Sample index of every simulation row (-1: sample not in the data) and the indices of the rows that pass every cut
+        except the CUTWINs. Both depend only on the sample definitions, the samples present in the data (with their z bin
+        sizes) and the global windows, not on the population cuts, so they are cached on the BiasCorSims object."""
+        cfg, S = self.cfg, self.sims.S
+        smp = self.samples
+        gkey = (tuple(tuple(m) for m in smp.members), tuple((g.name, g.zbin) for g in cfg.surveygroups),
+                tuple((f.name, f.zbin) for f in cfg.fieldgroups), tuple((s.key, s.zbin) for s in smp.samples))
+        wkey = (cfg.x1min, cfg.x1max, cfg.cmin, cfg.cmax, cfg.zmin, cfg.zmax, cfg.logmass_min, cfg.logmass_max)
+        cache = self.sims.__dict__.setdefault("_cut_cache", {})
+        if gkey not in cache:
+            if len(cache) >= SIM_CACHE_MAX:
+                cache.pop(next(iter(cache)))
+            s_smp = smp.assign(S["IDSURVEY"], S["FIELD_CODE"], S["FIELD_NAMES"])
+            cache[gkey] = {"s_smp": s_smp.astype(np.int32), "base": {}}
+        entry = cache[gkey]
+        s_smp = entry["s_smp"]
+        if wkey not in entry["base"]:
+            if len(entry["base"]) >= SIM_CACHE_MAX:
+                entry["base"].pop(next(iter(entry["base"])))
+            zmax_row = np.full(len(s_smp), -1.0)
+            for k, sm in enumerate(smp.samples):
+                zmax_row[s_smp == k] = cfg.zmax + sm.zbin
+            ok = self._selection(S, is_data=False, zmax_row=zmax_row, cutwins=False) & (s_smp >= 0)
+            entry["base"][wkey] = np.nonzero(ok)[0]
+        return s_smp, entry["base"][wkey]
+
+    def _selection(self, t, is_data, zmax_row, cutwins=True):
         cfg = self.cfg
         ok = np.ones(len(t["zHD"]), bool)
-        for cw in cfg.cutwins:
+        for cw in cfg.cutwins if cutwins else ():
             if cw.dataonly and not is_data:
                 continue
             ok &= window(t[cw.var], cw.lo, cw.hi)

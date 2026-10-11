@@ -22,10 +22,16 @@ twice) and deriving per-row quantities; the fit itself is a few percent of the r
 3. uses the fact that, in the supported configuration, the bias correction does not depend on the fitted alpha and beta (the
    simulated alpha/beta grid has a single cell), so the bias is fixed during the fit and the M0 of each redshift bin can be
    profiled analytically; only alpha, beta and gamma are minimized numerically;
-4. in the covariance helper, treats the systematic part of the covariance as low rank and solves with the Woodbury identity.
+4. computes the sample assignment of each simulated event and the cuts that do not depend on the population (redshift, x1,
+   c and host windows, error cuts) once per sample definition and caches them with the simulations, so a fit with other
+   `CUTWIN`s applies only its own windows to the pre-selected rows;
+5. finds the step of the `sigint_muresid_list` scan at which STD(pull) first exceeds 1 by bisection over the same sequence
+   of trial values (STD(pull) decreases as sigint increases), which gives the same result as the step-by-step scan;
+6. in the covariance helper, treats the systematic part of the covariance as low rank and solves with the Woodbury identity.
 
 Typical cost on a laptop: about 9 s to read and derive ~4 million simulated rows from npz files, then 3-8 s per BBC fit
-(preparation of the maps plus the fit), and about 1 GB of memory per process.
+(preparation of the maps plus the fit), less for a fit restricted to a sub-population (about 0.5 s for one of eight color
+bins with ~0.5 million simulated rows), and about 1 GB of memory per process.
 
 ## Supported configuration
 
