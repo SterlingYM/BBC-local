@@ -16,7 +16,7 @@ from .binning import biascor_zgrid, bininfo, ibin, powz_bins
 from .config import UnsupportedOptionError
 from .cosmo import Cosmology
 from .io import BIASCOR_COLS, DATA_COLS, read_biascor, read_cid_list
-from .maps import SampleMaps, sigint_scan
+from .maps import SampleMaps, _check_undefined_median, sigint_scan
 from .model import F32, M0_DEFAULT, derive, gamma_step, host_values, muerr_z, muerrsq_full, quadform, window
 from .samples import SampleSet
 
@@ -219,10 +219,19 @@ class BBC:
     BBC's assumption that the simulation describes the data in each cell, the bias correction that makes that weighted
     estimator unbiased is the cell average of the bias with the same weights; SALT2mu's 1/muerr^2 approximates this.
     map_rows(), default_map_weights() and mucov_at() give what is needed to compute such weights for every simulated row
-    (together with muerrsq_full in bbclocal.model)."""
+    (together with muerrsq_full in bbclocal.model).
+
+    undefined_median: "raise" (default) or "standard". With population weights, SALT2mu's weighted median (arrayStat_MEDIAN,
+    used for MUCOVSCALE = (1.48 x median |pull|)^2 per coarse cell) is undefined when the running sum of the weights never
+    reaches half the total (rounding) or when the crossing is at the last element with an even count (the C code reads past
+    the end of its index array); the latter occurs in practice with soft (fractional) SIM_WGT_POP. "raise" raises
+    RuntimeError there. "standard" returns the conventional weighted median instead: the value of the crossing element (the
+    smallest sorted value whose cumulative weight reaches half the total; the largest value if the sum never reaches it).
+    A NON-SNANA CHOICE, used only where SALT2mu's result is undefined; every defined case is unchanged. After prepare(),
+    n_undefined_median is the number of weighted medians that used the fallback (also in the fit result)."""
 
     def __init__(self, cfg, data, sims, survey_ids=None, cid_reject=None, validate=True, allow_unknown=False,
-                 map_weights=None):
+                 map_weights=None, undefined_median="raise"):
         if validate:
             cfg.validate(allow_unknown=allow_unknown)
         if sims.key != sim_key(cfg):
@@ -246,6 +255,8 @@ class BBC:
                 raise ValueError("map_weights must be finite and >= 0")
             map_weights = mw
         self.map_weights = map_weights
+        self.undefined_median = _check_undefined_median(undefined_median)
+        self.n_undefined_median = 0
 
     # ------------------------------------------------------------------------------------------------------------ prepare
     def prepare(self):
@@ -284,15 +295,19 @@ class BBC:
         a, b = self.sims.a_sim, self.sims.b_sim
         merr2 = muerrsq_full(S["cov"][:, hi], a, b, S["zHD"][hi].astype(float), S["zmuerr"][hi], cfg.lensing_zpar)
         wpop = self.sims.weights
+        fired = []
         self.sigint_biascor = sigint_scan(S["muresid"][hi], merr2, use_mad=False,
-                                          wgt=None if wpop is None else wpop[hi])
+                                          wgt=None if wpop is None else wpop[hi],
+                                          undefined_median=self.undefined_median, fired=fired)
         self.maps = {}
         for k in range(len(self.samples.samples)):
             rows = pas[s_smp[pas] == k]
             M = SampleMaps(self.zgrid[k], self.mgrid, S, rows, self.sigint_biascor ** 2, a, b, cfg, cfg.zmax, wpop=wpop,
-                           map_weights=self.map_weights)
+                           map_weights=self.map_weights, undefined_median=self.undefined_median)
             M.make_mucov(S, cfg)
             self.maps[k] = M
+            fired += M.undefined_median_cases
+        self.n_undefined_median = len(fired)
         # data cuts and per-event bias and error corrections
         cut = np.zeros(n, int)
         cut[~self._selection(d, is_data=True, zmax_row=np.full(n, cfg.zmax))] |= CUT_SELECTION
@@ -538,6 +553,7 @@ class BBC:
             "dust_flag": self.sims.dust_flag,
             "population_weights": self.sims.weights is not None, "min_weight": self.sims.min_weight,
             "map_weights": self.map_weights is not None,
+            "undefined_median": self.undefined_median, "n_undefined_median": int(self.n_undefined_median),
             "samples": [{"IDSAMPLE": k, "name": smp.name, "zbin": smp.zbin, "N_data_all": int((self.data_sample == k).sum()),
                          "N_fit": int(((self.data_sample == k) & u).sum()), "N_biascor": int(self.maps[k].nsim),
                          "z_grid": [float(self.zgrid[k].lo[0]), float(self.zgrid[k].hi[-1])]}

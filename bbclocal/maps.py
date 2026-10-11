@@ -68,7 +68,23 @@ def gsl_sort_index(data):
     return np.array(p, dtype=np.int64)
 
 
-def weighted_median(vals, wgt=None):
+UNDEFINED_MEDIAN_POLICIES = ("raise", "standard")
+
+
+def _check_undefined_median(policy):
+    if policy not in UNDEFINED_MEDIAN_POLICIES:
+        raise ValueError(f"undefined_median must be one of {UNDEFINED_MEDIAN_POLICIES}, got {policy!r}")
+    return policy
+
+
+def _crossing_index(cs, half):
+    """First i with running sum cs[i] >= half (cs is non-decreasing); len(cs) if never reached. With weights >= 0 the
+    latter requires the sorted-order sum to fall below half the input-order sum, which is not expected from rounding
+    alone; it is guarded because SALT2mu's loop would then run past its arrays."""
+    return int(np.searchsorted(cs, half, side="left"))
+
+
+def weighted_median(vals, wgt=None, undefined_median="raise", fired=None):
     """arrayStat_MEDIAN of sntools.c. Without weights: the ordinary median. With weights (all >= 0): sort the values, add the
     weights in sorted order until the running sum reaches half the total (sum >= total/2), and call that element imed0 and the
     next one in sorted order imed1; the median is 0.5*(v[imed0] + v[imed1]) for an EVEN number of elements and v[imed0] for an
@@ -76,8 +92,18 @@ def weighted_median(vals, wgt=None):
 
     The total is summed in input order and the running sum in sorted order, as in the C loops. The sort in SALT2mu is GSL's
     (unstable) heapsort; when tied values carry different weights at the crossing, the order of the tied elements matters,
-    and GSL's heapsort is then reproduced exactly. Cases in which SALT2mu aborts or reads past the end of its index array
-    (total weight 0; the crossing at the last element with even N) raise RuntimeError."""
+    and GSL's heapsort is then reproduced exactly.
+
+    SALT2mu's result is undefined in two cases: (a) the running sum never reaches half the total (rounding), and (b) the
+    crossing is at the last element with an even count (the C code reads past the end of its index array). undefined_median
+    sets what happens there:
+      "raise" (default): RuntimeError, as before;
+      "standard": the conventional weighted median, i.e. the value of the crossing element (the smallest sorted value whose
+        cumulative weight reaches half the total); in case (a), the largest value. THIS IS NOT A SALT2mu RESULT; it is used
+        only where SALT2mu's result is undefined, and every defined case is unchanged.
+    fired: optional list; the name of the case ("rounding" or "last_even") is appended each time the fallback is used.
+    Total weight 0 (where SALT2mu aborts) always raises RuntimeError."""
+    _check_undefined_median(undefined_median)
     v = np.asarray(vals, dtype=float)
     n = len(v)
     if n == 0:
@@ -93,35 +119,45 @@ def weighted_median(vals, wgt=None):
         raise RuntimeError("weighted median with total weight 0: SALT2mu's arrayStat_MEDIAN aborts here (all SIM_WGT_POP = 0 "
                            "in a cell that passes the count threshold); use with_weights(..., min_weight=0) to drop those rows")
 
+    def undefined(case, value, msg):
+        if undefined_median == "raise":
+            raise RuntimeError(msg)
+        if fired is not None:
+            fired.append(case)
+        return float(value)
+
+    msg_a = "weighted median: running sum never reaches half the total (rounding); undefined in SALT2mu"
+
     def crossing(order):
-        cs = np.cumsum(w[order])                          # sequential, sorted order
-        i = int(np.searchsorted(cs, half, side="left"))   # first i with running sum >= half (cs is non-decreasing)
-        if i >= n:
-            raise RuntimeError("weighted median: running sum never reaches half the total (rounding); undefined in SALT2mu")
-        return i
+        return _crossing_index(np.cumsum(w[order]), half)    # running sum: sequential, sorted order
 
     order = np.argsort(v, kind="stable")
     i = crossing(order)
+    if i >= n:
+        return undefined("rounding", v[order[-1]], msg_a)
     vs = v[order]
     lo = int(np.searchsorted(vs, vs[i], side="left"))
     hi = int(np.searchsorted(vs, vs[i], side="right"))
     if hi - lo > 1 and np.unique(w[order[lo:hi]]).size > 1:
         order = gsl_sort_index(v)                         # tie at the crossing with unequal weights: order matters
         i = crossing(order)
+        if i >= n:
+            return undefined("rounding", v[order[-1]], msg_a)
     imed0 = order[i]
     if n % 2 == 1:
         imed1 = imed0
     else:
         if i + 1 >= n:
-            raise RuntimeError("weighted median: the crossing is at the last element with an even count; SALT2mu's "
-                               "arrayStat_MEDIAN then reads past the end of its index array (undefined result)")
+            return undefined("last_even", v[imed0],
+                             "weighted median: the crossing is at the last element with an even count; SALT2mu's "
+                             "arrayStat_MEDIAN then reads past the end of its index array (undefined result)")
         imed1 = order[i + 1]
     return 0.5 * (v[imed0] + v[imed1])
 
 
-def _std_pull(dev, mucov, sig, use_mad, wgt=None):
+def _std_pull(dev, mucov, sig, use_mad, wgt=None, undefined_median="raise", fired=None):
     """STD (or 1.48 MAD) of the pull dev / sqrt(mucov + sig*|sig|), with the 0.02^2 floor for negative sig*|sig|.
-    wgt: population weights (arrayStat_STD / arrayStat_MEDIAN with weights)."""
+    wgt: population weights (arrayStat_STD / arrayStat_MEDIAN with weights); undefined_median, fired: see weighted_median."""
     covt = sig * abs(sig)
     tot = mucov + covt
     if covt < 0:
@@ -129,14 +165,14 @@ def _std_pull(dev, mucov, sig, use_mad, wgt=None):
     pull = dev / np.sqrt(tot)
     if wgt is not None:
         if use_mad:
-            return 1.48 * weighted_median(np.abs(pull), wgt)
+            return 1.48 * weighted_median(np.abs(pull), wgt, undefined_median, fired)
         return std_from_sums(len(pull), np.sum(wgt * pull), np.sum(wgt * pull ** 2))
     if use_mad:
         return 1.48 * np.median(np.abs(pull))
     return np.sqrt(max(np.mean(pull ** 2) - np.mean(pull) ** 2, 0.0))
 
 
-def sigint_scan(mures, mucov, use_mad, abort=True, bisect=True, wgt=None):
+def sigint_scan(mures, mucov, use_mad, abort=True, bisect=True, wgt=None, undefined_median="raise", fired=None):
     """sigint_muresid_list: scan sigint downward in steps of 0.01 from an approximate start until the STD (or 1.48 MAD) of the
     pull crosses 1; linear interpolation between the bracketing steps. Negative sigint means sigint*|sigint| < 0 is added.
 
@@ -149,7 +185,8 @@ def sigint_scan(mures, mucov, use_mad, abort=True, bisect=True, wgt=None):
 
     wgt: population weights (OPTMASK & 2 of sigint_muresid_list). The averages of mucov and mures are then weighted means;
     STD uses weighted sums divided by the COUNT N (STD_from_SUMS quirk); the MAD uses the weighted median. A weighted scan
-    is always done step by step."""
+    is always done step by step. undefined_median, fired: policy for the weighted medians where SALT2mu's result is undefined
+    (see weighted_median)."""
     mures = np.asarray(mures, float)
     mucov = np.asarray(mucov, float)
     if wgt is not None:
@@ -158,7 +195,7 @@ def sigint_scan(mures, mucov, use_mad, abort=True, bisect=True, wgt=None):
         avg_cov = np.sum(wgt * mucov) / sw
         avg_res = np.sum(wgt * mures) / sw
         if use_mad:
-            std_orig = 1.48 * weighted_median(np.abs(mures), wgt)
+            std_orig = 1.48 * weighted_median(np.abs(mures), wgt, undefined_median, fired)
         else:
             std_orig = std_from_sums(len(mures), np.sum(wgt * mures), np.sum(wgt * mures ** 2))
         bisect = False
@@ -174,7 +211,7 @@ def sigint_scan(mures, mucov, use_mad, abort=True, bisect=True, wgt=None):
     approx = -np.sqrt(abs(tmp)) if tmp < 0 else np.sqrt(tmp)
     lo = approx - 50 * 0.01 - 1e-7
     sig = approx + 60 * 0.01
-    sp = _std_pull(dev, mucov, sig, use_mad, wgt)
+    sp = _std_pull(dev, mucov, sig, use_mad, wgt, undefined_median, fired)
     if sp > 1.0:
         sig += (sp - 1.0) + 0.1            # one-time upward adjustment; this first evaluation is not stored
     seq = []                               # trial values, by repeated subtraction as in SALT2mu
@@ -183,13 +220,13 @@ def sigint_scan(mures, mucov, use_mad, abort=True, bisect=True, wgt=None):
         sig -= 0.01
     # monotonic only with the MAD and no 0.02^2 floor jump at sigint = 0 (floor applies only for negative sigint)
     if bisect and use_mad and mucov.min() >= 0.02 ** 2:
-        if _std_pull(dev, mucov, seq[-1], use_mad, wgt) <= 1.0:
+        if _std_pull(dev, mucov, seq[-1], use_mad, wgt, undefined_median, fired) <= 1.0:
             stop = None
         else:
             j0, j1 = -1, len(seq) - 1      # MAD > 1 at seq[j1]; <= 1 at seq[j0] (or j0 = -1)
             while j1 - j0 > 1:
                 mid = (j0 + j1) // 2
-                if _std_pull(dev, mucov, seq[mid], use_mad, wgt) > 1.0:
+                if _std_pull(dev, mucov, seq[mid], use_mad, wgt, undefined_median, fired) > 1.0:
                     j1 = mid
                 else:
                     j0 = mid
@@ -197,7 +234,7 @@ def sigint_scan(mures, mucov, use_mad, abort=True, bisect=True, wgt=None):
     else:
         stop = None
         for j, s in enumerate(seq):
-            if _std_pull(dev, mucov, s, use_mad, wgt) > 1.0:
+            if _std_pull(dev, mucov, s, use_mad, wgt, undefined_median, fired) > 1.0:
                 stop = j
                 break
     if stop is None:
@@ -205,7 +242,7 @@ def sigint_scan(mures, mucov, use_mad, abort=True, bisect=True, wgt=None):
             raise RuntimeError("sigint scan did not bracket STD(pull) = 1")
         return lo
     sig_store = seq[max(stop - 1, 0):stop + 1]
-    pull_store = [_std_pull(dev, mucov, s, use_mad, wgt) for s in sig_store]
+    pull_store = [_std_pull(dev, mucov, s, use_mad, wgt, undefined_median, fired) for s in sig_store]
     if len(sig_store) == 1 and abs(pull_store[0] - 1.0) < 0.001:
         return sig_store[0]
     return float(np.interp(1.0, np.array(pull_store), np.array(sig_store)))   # pull increases as sig decreases
@@ -219,9 +256,16 @@ class SampleMaps:
     map_weights: None (default; SALT2mu) or one finite value >= 0 per row of the full simulation table. When given, it
     replaces the 1/muerr^2 factor of the weights of the bias value VAL and the cell averages AVG_z/m/x1/c of the 5D map:
     w = WGT_POP * map_weights[row] instead of WGT_POP / muerr^2. Everything else (counts and thresholds, the construction
-    of the MUCOV maps, the RMS/ERR diagnostics) is unchanged. Not a SALT2mu option; see BBC and the README ("Map weights")."""
+    of the MUCOV maps, the RMS/ERR diagnostics) is unchanged. Not a SALT2mu option; see BBC and the README ("Map weights").
 
-    def __init__(self, zgrid, mgrid, sims, rows, sig2int, a_sim, b_sim, cfg, zmax_fit, wpop=None, map_weights=None):
+    undefined_median: "raise" (default) or "standard"; policy for the weighted medians (MUCOVSCALE with population weights)
+    in the cases where SALT2mu's arrayStat_MEDIAN is undefined (see weighted_median). undefined_median_cases lists each
+    use of the fallback ("rounding" or "last_even")."""
+
+    def __init__(self, zgrid, mgrid, sims, rows, sig2int, a_sim, b_sim, cfg, zmax_fit, wpop=None, map_weights=None,
+                 undefined_median="raise"):
+        self.undefined_median = _check_undefined_median(undefined_median)
+        self.undefined_median_cases = []                 # one entry per weighted median that used the fallback
         self.Bz, self.Bm = zgrid, mgrid
         self.Bs, self.Bc = bininfo(*BIN_X1), bininfo(*BIN_C)
         self.a_sim, self.b_sim, self.lens = a_sim, b_sim, cfg.lensing_zpar
@@ -434,10 +478,11 @@ class SampleMaps:
             if wp is None:
                 mad = 1.48 * float(np.median(np.abs(pull[idx])))       # unit weights: ordinary median
             else:
-                mad = 1.48 * float(weighted_median(np.abs(pull[idx]), wp[idx]))
+                mad = 1.48 * float(weighted_median(np.abs(pull[idx]), wp[idx], self.undefined_median,
+                                                   self.undefined_median_cases))
             self.cscale[k] = F32(mad * mad)
             # MUCOVADD: SALT2mu passes WGT_IGNORE here, so this scan is unweighted even with population weights
-            si = sigint_scan(mudif[idx], merr2[idx], use_mad=True, abort=False)
+            si = sigint_scan(mudif[idx], merr2[idx], use_mad=True, abort=False)   # unweighted: no undefined median
             if si == 0.0:
                 si = 1e-12
             self.cadd[k] = F32(si * abs(si))

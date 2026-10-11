@@ -405,3 +405,104 @@ def test_map_weights_with_weights_view(toyset):
             used = M.N >= 1
             assert np.allclose(M.val[used], hand[k][0][used], rtol=0, atol=1e-12)
             assert np.array_equal(M.N, Bv.maps[k].N)
+
+
+# ---------------------------------------------------------------- undefined weighted medians (non-SNANA "standard" policy)
+def _conventional_median(v, w):
+    """value of the first sorted element whose cumulative weight reaches half the total (the largest if none does)"""
+    v, w = np.asarray(v, float), np.asarray(w, float)
+    o = gsl_sort_index(v)
+    i = min(int(np.searchsorted(np.cumsum(w[o]), np.cumsum(w)[-1] / 2, side="left")), len(v) - 1)
+    return float(v[o[i]])
+
+
+def test_undefined_median_default_raises_both_cases(monkeypatch):
+    import bbclocal.maps as maps
+    with pytest.raises(RuntimeError, match="reads past the end"):                       # (b) last element, even count
+        weighted_median([1.0, 2.0, 3.0, 4.0], [0.0, 0.0, 0.0, 1.0])
+    with pytest.raises(RuntimeError, match="reads past the end"):
+        weighted_median([1.0, 2.0, 3.0, 4.0], [0.0, 0.0, 0.0, 1.0], undefined_median="raise")
+    monkeypatch.setattr(maps, "_crossing_index", lambda cs, half: len(cs))              # (a) running sum never reaches half
+    with pytest.raises(RuntimeError, match="never reaches half"):
+        weighted_median([3.0, 1.0, 2.0], [1.0, 1.0, 1.0])
+    fired = []
+    assert weighted_median([3.0, 1.0, 2.0], [1.0, 1.0, 1.0], undefined_median="standard", fired=fired) == 3.0
+    assert fired == ["rounding"]
+
+
+def test_undefined_median_standard_values():
+    fired = []
+    assert weighted_median([1.0, 2.0, 3.0, 4.0], [0.0, 0.0, 0.0, 1.0], "standard", fired) == 4.0
+    assert weighted_median([4.0, 3.0, 1.0, 2.0], [3.0, 1.0, 0.0, 0.0], "standard", fired) == 4.0   # cumsum 0,0,1,4; half 2
+    assert weighted_median([0.5, 0.2, 0.9, 0.7], [0.1, 0.2, 0.6, 0.1], "standard", fired) == 0.9
+    assert fired == ["last_even"] * 3
+    assert weighted_median([1.0, 2.0, 3.0, 4.0], [1.0, 1.0, 0.0, 0.0], "standard", fired) == 1.5   # defined: unchanged
+    assert len(fired) == 3
+    with pytest.raises(RuntimeError, match="total weight 0"):                           # SALT2mu aborts: still raises
+        weighted_median([1.0, 2.0], [0.0, 0.0], undefined_median="standard")
+    with pytest.raises(ValueError, match="undefined_median"):
+        weighted_median([1.0, 2.0], [1.0, 1.0], undefined_median="mean")
+
+
+@pytest.mark.parametrize("seed", range(300))
+def test_undefined_median_policy_changes_only_undefined_cases(seed):
+    rng = np.random.default_rng(1000 + seed)
+    n = int(rng.integers(1, 12))
+    v = rng.integers(0, 4, n).astype(float) if seed % 3 == 0 else rng.normal(size=n)
+    w = rng.choice([0.0, 0.3, 1.0, 4.0], n) if seed % 2 else rng.uniform(0, 1, n) ** 4
+    if not w.sum() > 0:
+        w[0] = 1.0
+    fired = []
+    try:
+        ref = weighted_median(v, w)
+    except RuntimeError:
+        ref = None
+    got = weighted_median(v, w, undefined_median="standard", fired=fired)
+    if ref is not None:
+        assert got == ref and fired == []
+        assert type(got) is type(ref)
+    else:
+        assert fired == ["last_even"] and n % 2 == 0
+        assert got == _conventional_median(v, w) == v.max()
+
+
+def test_undefined_median_propagates_to_sigint_scan_and_bbc(toyset, monkeypatch):
+    """the policy reaches every weighted median (MUCOVSCALE, weighted MAD scans) and the fallbacks are counted"""
+    import bbclocal.maps as maps
+    rng = np.random.default_rng(23)
+    res, cov, w = rng.normal(0, 0.15, 40), np.full(40, 0.01), rng.uniform(0.5, 1.5, 40)
+    w2 = np.where(np.abs(res) == np.abs(res).max(), 1e6, w)          # the largest |residual| carries almost all the weight
+    with pytest.raises(RuntimeError, match="reads past the end"):
+        sigint_scan(res, cov, use_mad=True, abort=False, wgt=w2)
+    fired = []
+    sigint_scan(res, cov, use_mad=True, abort=False, wgt=w2, undefined_median="standard", fired=fired)
+    assert len(fired) > 0 and set(fired) == {"last_even"}
+    assert sigint_scan(res, cov, use_mad=True, wgt=w, undefined_median="standard") == sigint_scan(res, cov, use_mad=True,
+                                                                                                    wgt=w)
+    paths, cfg, sims = toyset
+    v = sims.with_weights(np.random.default_rng(29).uniform(0.5, 1.5, sims.nrow))
+    with pytest.raises(ValueError, match="undefined_median"):
+        BBC(cfg, read_fitres(paths["data"]), v, survey_ids=toy.SURVEY_IDS, cid_reject=[], undefined_median="x")
+    Br = _bbc(cfg, paths, v)
+    rr = Br.fit()
+    assert Br.undefined_median == "raise" and Br.n_undefined_median == 0
+    assert rr["undefined_median"] == "raise" and rr["n_undefined_median"] == 0
+    seen = []
+    real = maps.weighted_median
+
+    def spy(vals, wgt=None, undefined_median="raise", fired=None):
+        seen.append(undefined_median)
+        out = real(vals, wgt, undefined_median, fired)
+        if fired is not None and len(seen) % 2 == 0:
+            fired.append("last_even")                       # pretend every second median used the fallback
+        return out
+    monkeypatch.setattr(maps, "weighted_median", spy)
+    Bs = BBC(cfg, read_fitres(paths["data"]), v, survey_ids=toy.SURVEY_IDS, cid_reject=[],
+             undefined_median="standard").prepare()
+    rs = Bs.fit()
+    assert seen and set(seen) == {"standard"}
+    assert Bs.n_undefined_median == len(seen) // 2 == rs["n_undefined_median"] > 0
+    assert rs["undefined_median"] == "standard"
+    for k in ("alpha0", "beta0", "gamma0", "sigint"):                # no undefined case in this toy: identical results
+        assert rs[k] == rr[k]
+    assert np.array_equal(Bs.mubias, Br.mubias, equal_nan=True)
