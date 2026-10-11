@@ -190,6 +190,58 @@ rows should play no role at all. The default (`min_weight=None`) is faithful to 
 With all weights equal to 1, the weighted code path gives results bit-identical to the unweighted one (checked on real data
 for the global fit and two color windows on two data samples).
 
+## Map weights (research option, not in SALT2mu)
+
+`BBC(cfg, data, sims, ..., map_weights=w)` replaces the weights of the simulated events in the 5D bias map. This option
+does not exist in SNANA; results obtained with it are not SALT2mu results.
+
+In SALT2mu (and in `bbclocal` by default) each simulated event enters the bias value of its cell and the cell averages of
+z, host, x1 and c (used by the interpolation) with weight `SIM_WGT_POP / sigma_mu^2`, where `sigma_mu^2` is computed with
+the simulated alpha and beta (p1, p2) and the sigint of the simulated events with `SNRMAX1 >= 60`. With `map_weights`, the
+weight becomes `SIM_WGT_POP * w[row]`, for the bias value and the cell averages alike. `w` has one finite value `>= 0` per
+row of the full simulation table (the index space of `sims.S`, also for views made with `with_weights`). Nothing else
+changes: the counts and count thresholds (a row with `w = 0` still counts, as a row with `SIM_WGT_POP = 0` does), the way
+the MUCOVSCALE/MUCOVADD maps are built (they change only through the interpolated bias of each simulated event), the map
+sigint and the fit. A cell that passes `min_per_cell_biascor` by count but has total weight 0 raises an error. As in
+SALT2mu, a cell with summed weight below 1e-9 gets no average, so `w` should have a scale comparable to `1/sigma_mu^2`.
+
+Motivation. The BBC fit is an inverse-variance weighted estimator: each SN enters with weight `1/sigma_fit^2`, computed
+with the fitted alpha, beta and sigint and the MUCOVADD/MUCOVSCALE term. In a flux-limited sample these weights are
+correlated with the Hubble residuals. Under BBC's assumption that the simulation describes the data in each cell, the bias
+correction that makes this weighted estimator unbiased is the cell average of the bias computed with the same weights.
+SALT2mu's `1/sigma_mu^2` (simulated alpha and beta, map sigint, no MUCOV term) approximates these weights. `map_weights`
+allows the exact fit weights, or any other choice, to be used instead.
+
+What a caller needs for this (after `prepare()`):
+
+- `B.map_rows()` returns `(rows, sample_index)`: the simulated rows that enter the bias maps and the bias-correction sample
+  of each;
+- `B.default_map_weights()` returns SALT2mu's `1/sigma_mu^2` for those rows (0 elsewhere); passing it as `map_weights`
+  reproduces the default maps exactly;
+- `B.mucov_at(sample_index, z, host, c)` returns `(muCOVadd, muCOVscale, ok)` at arbitrary points, as applied to the data;
+- `bbclocal.model.muerrsq_full` gives `sigma_mu^2` from the covariance columns for any alpha, beta and sigint.
+
+```python
+import numpy as np
+from bbclocal import BBC, read_fitres
+from bbclocal.model import muerr_z, muerrsq_full
+
+B0 = BBC(cfg, read_fitres(data_file), sims).prepare()
+r0 = B0.fit()
+rows, smp = B0.map_rows()
+S = sims.S
+z, host, c = S["zHD"][rows].astype(float), S["__HOST__"][rows], S["c"][rows].astype(float)
+e2 = muerrsq_full(S["cov"][:, rows], r0["alpha0"], r0["beta0"], z, S["zmuerr"][rows], cfg.lensing_zpar,
+                  r0["sigint"] ** 2)
+vpec2 = muerr_z(z, S["zmuerr"][rows]) ** 2
+add, scl, ok = B0.mucov_at(smp, z, host, c)
+e2_fit = np.where(add > 0, e2 + add, (e2 - vpec2) * scl + vpec2)     # as the fit applies MUCOVADD / MUCOVSCALE
+w = np.zeros(sims.nrow)
+w[rows[ok]] = 1.0 / e2_fit[ok]          # rows without a valid MUCOV correction keep weight 0 (they still count)
+B1 = BBC(cfg, read_fitres(data_file), sims, map_weights=w).prepare()
+r1 = B1.fit()
+```
+
 ## Installation
 
 ```

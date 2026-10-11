@@ -214,9 +214,14 @@ def sigint_scan(mures, mucov, use_mad, abort=True, bisect=True, wgt=None):
 class SampleMaps:
     """Maps of one sample. sims: dict of derived bias-correction arrays (all rows); rows: indices of this sample's rows that
     pass every cut. a_sim, b_sim: alpha, beta used for the cell weights and for mu of the simulations. wpop: population
-    weights of all rows (float64 of the float32 SIM_WGT_POP), or None for unit weights."""
+    weights of all rows (float64 of the float32 SIM_WGT_POP), or None for unit weights.
 
-    def __init__(self, zgrid, mgrid, sims, rows, sig2int, a_sim, b_sim, cfg, zmax_fit, wpop=None):
+    map_weights: None (default; SALT2mu) or one finite value >= 0 per row of the full simulation table. When given, it
+    replaces the 1/muerr^2 factor of the weights of the bias value VAL and the cell averages AVG_z/m/x1/c of the 5D map:
+    w = WGT_POP * map_weights[row] instead of WGT_POP / muerr^2. Everything else (counts and thresholds, the construction
+    of the MUCOV maps, the RMS/ERR diagnostics) is unchanged. Not a SALT2mu option; see BBC and the README ("Map weights")."""
+
+    def __init__(self, zgrid, mgrid, sims, rows, sig2int, a_sim, b_sim, cfg, zmax_fit, wpop=None, map_weights=None):
         self.Bz, self.Bm = zgrid, mgrid
         self.Bs, self.Bc = bininfo(*BIN_X1), bininfo(*BIN_C)
         self.a_sim, self.b_sim, self.lens = a_sim, b_sim, cfg.lensing_zpar
@@ -234,21 +239,27 @@ class SampleMaps:
         self.shape = (self.Bz.n, self.Bm.n, self.Bs.n, self.Bc.n)
         J = np.ravel_multi_index((iz, im, is_, ic), self.shape)
         NC = int(np.prod(self.shape))
-        w = 1.0 / muerrsq_full(sims["cov"][:, rows], a_sim, b_sim, z, sims["zmuerr"][rows], self.lens, sig2int)
+        if map_weights is None:
+            w = 1.0 / muerrsq_full(sims["cov"][:, rows], a_sim, b_sim, z, sims["zmuerr"][rows], self.lens, sig2int)
+        else:
+            w = np.asarray(map_weights, dtype=float)[rows]   # research option: replaces 1/muerrsq (not SALT2mu)
         self.wpop = wpop
+        self.map_weights = map_weights is not None
         if wpop is not None:
             wp = wpop[rows]
             w = wp * w                                    # WGT_biasCor: WGT_POP * (1/muerrsq)
-            if len(rows) and not (w > 0).any():
-                raise RuntimeError("all bias-correction weights are 0 in a sample (SALT2mu's makeMap_binavg_biasCor aborts)")
+        if (wpop is not None or map_weights is not None) and len(rows) and not (w > 0).any():
+            raise RuntimeError("all bias-correction weights are 0 in a sample (SALT2mu's makeMap_binavg_biasCor aborts)")
         sw = np.bincount(J, w, NC)
         self.N = np.bincount(J, minlength=NC)            # NperCell: an unweighted count in SALT2mu, also with weights
-        if wpop is not None:
+        if wpop is not None or map_weights is not None:
             dead = (self.N >= self.min_per_cell) & (sw == 0)
             if dead.any():
+                src = "map_weights x WGT_POP" if map_weights is not None else "SIM_WGT_POP"
                 raise RuntimeError(
-                    f"{int(dead.sum())} bias-map cell(s) pass min_per_cell_biascor by count but have total weight 0; SALT2mu "
-                    "would interpolate a 0/0 (NaN) bias there. Use with_weights(..., min_weight=0) to drop zero-weight rows")
+                    f"{int(dead.sum())} bias-map cell(s) pass min_per_cell_biascor by count but have total weight 0 "
+                    f"({src}); SALT2mu would interpolate a 0/0 (NaN) bias there. Use with_weights(..., min_weight=0) to "
+                    "drop zero-weight rows")
         with np.errstate(invalid="ignore", divide="ignore"):
             self.avg = {k: np.where(sw >= 1e-9, np.bincount(J, w * v, NC) / sw, 9999.0)
                         for k, v in (("z", z), ("m", m), ("s", s), ("c", c))}

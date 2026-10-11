@@ -201,9 +201,28 @@ class BBC:
 
     cfg: validated BBCConfig; data: dict from io.read_fitres (it is extended in place with derived columns); sims:
     BiasCorSims built with a compatible configuration; survey_ids: {survey name: IDSURVEY} for surveygroup_biascor names;
-    cid_reject: iterable of CIDs (data only); if None and cfg.cid_reject_file is readable, that file is used."""
+    cid_reject: iterable of CIDs (data only); if None and cfg.cid_reject_file is readable, that file is used.
 
-    def __init__(self, cfg, data, sims, survey_ids=None, cid_reject=None, validate=True, allow_unknown=False):
+    map_weights: None (default) or one finite value >= 0 per row of the full simulation table (index space of sims.S, in
+    file order; the same for views made with sims.with_weights). A RESEARCH OPTION THAT SALT2mu DOES NOT HAVE. SALT2mu
+    weights each simulated event in the bias value VAL and the cell averages AVG_z/m/x1/c of the 5D bias map by
+    WGT_POP / muerr^2, with muerr^2 from the simulated alpha, beta (p1, p2) and the sigint of the SNRMAX1 >= 60 rows. With
+    map_weights, these weights become WGT_POP * map_weights[row] (for VAL and AVG alike). Nothing else changes: the counts
+    and count thresholds (a row with map weight 0 still counts toward NperCell, as with WGT_POP = 0), the construction of
+    the MUCOVSCALE and MUCOVADD maps (the simulations' own error model; they change only through the interpolated bias of
+    each simulated event, as they do with SIM_WGT_POP), the SNRMAX1 >= 60 sigint, and the fit. A cell that passes
+    min_per_cell_biascor by count but has total weight 0 raises RuntimeError. As in SALT2mu, a cell whose summed weight
+    is below 1e-9 gets no average (AVG = 9999), so the weights should have a scale comparable to 1/muerr^2 (mag^-2).
+
+    Motivation. The fit is an inverse-variance weighted estimator with weights 1/sigma_fit^2 (fitted alpha, beta, sigint
+    and the MUCOVADD/MUCOVSCALE term). In flux-limited samples these weights are correlated with the residuals. Under
+    BBC's assumption that the simulation describes the data in each cell, the bias correction that makes that weighted
+    estimator unbiased is the cell average of the bias with the same weights; SALT2mu's 1/muerr^2 approximates this.
+    map_rows(), default_map_weights() and mucov_at() give what is needed to compute such weights for every simulated row
+    (together with muerrsq_full in bbclocal.model)."""
+
+    def __init__(self, cfg, data, sims, survey_ids=None, cid_reject=None, validate=True, allow_unknown=False,
+                 map_weights=None):
         if validate:
             cfg.validate(allow_unknown=allow_unknown)
         if sims.key != sim_key(cfg):
@@ -219,6 +238,14 @@ class BBC:
         self.cid_reject = set(map(str, cid_reject or ()))
         self.cosmo = cosmology_from_config(cfg)
         self.result = None
+        if map_weights is not None:
+            mw = np.asarray(map_weights, dtype=float)
+            if mw.shape != (sims.nrow,):
+                raise ValueError(f"map_weights must have one value per simulated row ({sims.nrow}), got shape {mw.shape}")
+            if not np.isfinite(mw).all() or (mw < 0).any():
+                raise ValueError("map_weights must be finite and >= 0")
+            map_weights = mw
+        self.map_weights = map_weights
 
     # ------------------------------------------------------------------------------------------------------------ prepare
     def prepare(self):
@@ -262,7 +289,8 @@ class BBC:
         self.maps = {}
         for k in range(len(self.samples.samples)):
             rows = pas[s_smp[pas] == k]
-            M = SampleMaps(self.zgrid[k], self.mgrid, S, rows, self.sigint_biascor ** 2, a, b, cfg, cfg.zmax, wpop=wpop)
+            M = SampleMaps(self.zgrid[k], self.mgrid, S, rows, self.sigint_biascor ** 2, a, b, cfg, cfg.zmax, wpop=wpop,
+                           map_weights=self.map_weights)
             M.make_mucov(S, cfg)
             self.maps[k] = M
         # data cuts and per-event bias and error corrections
@@ -289,6 +317,52 @@ class BBC:
             cut[q[~good]] |= CUT_BIASCOR
         self.cutflag = cut
         return self
+
+    # ------------------------------------------------------------------------------------- per-row access to the maps
+    def _need_prepare(self):
+        if not hasattr(self, "maps"):
+            raise RuntimeError("run prepare() first")
+
+    def map_rows(self):
+        """(rows, sample_index): the simulated rows that enter the 5D bias maps (all cuts passed and inside the bias-map
+        grid), as indices into the full simulation table (sims.S), in ascending order, with the bias-correction sample
+        (IDSAMPLE) of each. These are the rows whose map weight matters; map_weights of all other rows are ignored."""
+        self._need_prepare()
+        rows = np.concatenate([M.rows for M in self.maps.values()]).astype(np.int64)
+        smp = np.concatenate([np.full(len(M.rows), k, np.int64) for k, M in self.maps.items()])
+        o = np.argsort(rows, kind="stable")
+        return rows[o], smp[o]
+
+    def default_map_weights(self):
+        """SALT2mu's 1/muerr^2 factor of the map weights (without WGT_POP) for every simulated row: muerr^2 from the
+        simulated alpha, beta and the SNRMAX1 >= 60 sigint (sigint_biascor) at the rows of map_rows(), 0 elsewhere.
+        Passing it as map_weights reproduces the default maps exactly."""
+        self._need_prepare()
+        S, cfg = self.sims.S, self.cfg
+        rows, _ = self.map_rows()
+        out = np.zeros(self.sims.nrow)
+        out[rows] = 1.0 / muerrsq_full(S["cov"][:, rows], self.sims.a_sim, self.sims.b_sim, S["zHD"][rows].astype(float),
+                                       S["zmuerr"][rows], cfg.lensing_zpar, self.sigint_biascor ** 2)
+        return out
+
+    def mucov_at(self, sample_index, z, host, c):
+        """MUCOVADD and MUCOVSCALE (get_muCOVcorr) of bias-correction sample(s) sample_index at arbitrary (z, host, c).
+        sample_index: an int or one value per point. Returns (muCOVadd, muCOVscale, ok); where ok is False the point has
+        no valid correction (a data event there would be cut) and (0, 1) is returned. As in the fit, MUCOVADD replaces
+        the scaling when it is > 0: muerr^2 -> muerr^2 + muCOVadd, otherwise (muerr^2 - sigma_vpec^2) * muCOVscale +
+        sigma_vpec^2."""
+        self._need_prepare()
+        z = np.atleast_1d(np.asarray(z, dtype=float))
+        host = np.atleast_1d(np.asarray(host, dtype=float))
+        c = np.atleast_1d(np.asarray(c, dtype=float))
+        smp = np.broadcast_to(np.asarray(sample_index), z.shape)
+        add, scl, ok = np.zeros(len(z)), np.ones(len(z)), np.zeros(len(z), bool)
+        for k in np.unique(smp):
+            if int(k) not in self.maps:
+                raise ValueError(f"no bias-correction sample {k}")
+            q = smp == k
+            add[q], scl[q], ok[q] = self.maps[int(k)].mucov(z[q], host[q], c[q])
+        return add, scl, ok
 
     def _sim_base_rows(self):
         """Sample index of every simulation row (-1: sample not in the data) and the indices of the rows that pass every cut
@@ -463,6 +537,7 @@ class BBC:
             "NCOVFIX_data": int(d["NCOVFIX"]), "NCOVFIX_biascor": int(self.sims.S["NCOVFIX"]),
             "dust_flag": self.sims.dust_flag,
             "population_weights": self.sims.weights is not None, "min_weight": self.sims.min_weight,
+            "map_weights": self.map_weights is not None,
             "samples": [{"IDSAMPLE": k, "name": smp.name, "zbin": smp.zbin, "N_data_all": int((self.data_sample == k).sum()),
                          "N_fit": int(((self.data_sample == k) & u).sum()), "N_biascor": int(self.maps[k].nsim),
                          "z_grid": [float(self.zgrid[k].lo[0]), float(self.zgrid[k].hi[-1])]}
